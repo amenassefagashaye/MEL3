@@ -1,0 +1,22 @@
+{
+  "imports": {
+    "oak": "https://deno.land/x/oak@v12.6.1/mod.ts",
+    "cors": "https://deno.land/x/cors@v1.2.2/mod.ts",
+    "dotenv": "https://deno.land/x/dotenv@v3.2.2/mod.ts",
+    "uuid": "https://deno.land/std@0.204.0/uuid/mod.ts"
+  },
+  "tasks": {
+    "start": "deno run --allow-net --allow-env --allow-read --allow-write server.ts",
+    "dev": "deno run --watch --allow-net --allow-env --allow-read --allow-write server.ts",
+    "test": "deno test --allow-net --allow-env --allow-read",
+    "lint": "deno lint",
+    "format": "deno fmt"
+  },
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noUnusedParameters": true,
+    "noUnusedLocals": true
+  }
+}
