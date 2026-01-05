@@ -1,10 +1,45 @@
 import { Application, Router } from "https://deno.land/x/oak@v12.6.1/mod.ts";
 import { oakCors } from "https://deno.land/x/cors@v1.2.2/mod.ts";
-import { WebSocket, WebSocketClient } from "./utils/websocket.ts";
-import { Player, Room } from "./models/interfaces.ts";
-import { validateAdmin, validatePlayer } from "./middlewares/auth.ts";
-import { broadcastToRoom, sendToClient } from "./services/broadcaster.ts";
-import { logger } from "./services/logger.ts";
+
+// Types and interfaces
+interface Player {
+  id: string;
+  name: string;
+  phone: string;
+  stake: number;
+  gameType: string;
+  payment: number;
+  joinedAt: Date;
+  socket: WebSocket | null;
+  roomId: string | null;
+  markedNumbers: Set<number>;
+  balance: number;
+  wonAmount?: number;
+  withdrawn?: number;
+}
+
+interface Room {
+  id: string;
+  gameType: string;
+  stake: number;
+  players: Set<string>;
+  admin: WebSocket | null;
+  active: boolean;
+  calledNumbers: number[];
+  winners: Array<{
+    playerId: string;
+    name: string;
+    pattern: string;
+    amount: number;
+    timestamp: Date;
+  }>;
+  createdAt: Date;
+}
+
+interface WebSocketMessage {
+  type: string;
+  [key: string]: any;
+}
 
 // Load environment variables
 const PORT = Deno.env.get("PORT") || "8000";
@@ -15,6 +50,74 @@ const SECRET_KEY = Deno.env.get("SECRET_KEY") || "assefa_gashaye_bingo_secret_20
 const rooms = new Map<string, Room>();
 const players = new Map<string, Player>();
 const adminConnections = new Set<WebSocket>();
+
+// Helper functions
+function broadcastToRoom(roomId: string, message: WebSocketMessage) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  const messageStr = JSON.stringify(message);
+  room.players.forEach(playerId => {
+    const player = players.get(playerId);
+    if (player?.socket?.readyState === WebSocket.OPEN) {
+      player.socket.send(messageStr);
+    }
+  });
+}
+
+function sendToClient(ws: WebSocket | null, message: WebSocketMessage) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(message));
+  }
+}
+
+function broadcastToAdmins(message: WebSocketMessage) {
+  const messageStr = JSON.stringify(message);
+  adminConnections.forEach(admin => {
+    if (admin.readyState === WebSocket.OPEN) {
+      admin.send(messageStr);
+    }
+  });
+}
+
+// Simple middleware functions
+function validateAdmin(ctx: any, next: () => Promise<unknown>) {
+  const token = ctx.request.headers.get("authorization")?.replace("Bearer ", "");
+  if (!token) {
+    ctx.response.status = 401;
+    ctx.response.body = { success: false, message: "No token provided" };
+    return;
+  }
+  
+  try {
+    const decoded = atob(token);
+    if (!decoded.includes(SECRET_KEY)) {
+      throw new Error("Invalid token");
+    }
+    return next();
+  } catch {
+    ctx.response.status = 401;
+    ctx.response.body = { success: false, message: "Invalid token" };
+  }
+}
+
+function validatePlayer(ctx: any, next: () => Promise<unknown>) {
+  const playerId = ctx.request.headers.get("x-player-id");
+  if (!playerId) {
+    ctx.response.status = 401;
+    ctx.response.body = { success: false, message: "Player ID required" };
+    return;
+  }
+  return next();
+}
+
+// Logger middleware
+async function logger(ctx: any, next: () => Promise<unknown>) {
+  const start = Date.now();
+  await next();
+  const ms = Date.now() - start;
+  console.log(`${ctx.request.method} ${ctx.request.url} - ${ms}ms`);
+}
 
 // Create application
 const app = new Application();
@@ -34,7 +137,7 @@ router.get("/health", (ctx) => {
 // Admin authentication endpoint
 router.post("/admin/login", async (ctx) => {
   try {
-    const body = await ctx.request.body().value;
+    const body = await ctx.request.body({ type: 'json' }).value;
     const { password } = body;
     
     if (password === ADMIN_PASSWORD) {
@@ -61,7 +164,7 @@ router.post("/admin/login", async (ctx) => {
 });
 
 // Get game statistics
-router.get("/stats", validateAdmin, (ctx) => {
+router.get("/stats", (ctx) => validateAdmin(ctx, async () => {
   const stats = {
     totalRooms: rooms.size,
     totalPlayers: players.size,
@@ -73,10 +176,10 @@ router.get("/stats", validateAdmin, (ctx) => {
   };
   
   ctx.response.body = { success: true, stats };
-});
+}));
 
 // Get room information
-router.get("/room/:roomId", validatePlayer, (ctx) => {
+router.get("/room/:roomId", (ctx) => validatePlayer(ctx, async () => {
   const { roomId } = ctx.params;
   const room = rooms.get(roomId);
   
@@ -98,7 +201,7 @@ router.get("/room/:roomId", validatePlayer, (ctx) => {
       winners: room.winners
     }
   };
-});
+}));
 
 // WebSocket upgrade handler
 router.get("/ws", async (ctx) => {
@@ -108,12 +211,12 @@ router.get("/ws", async (ctx) => {
   }
   
   const socket = await ctx.upgrade();
-  const ws = new WebSocket(socket);
+  const ws = socket as any; // Type assertion for custom properties
   
   // Set up WebSocket event handlers
-  ws.on("message", async (data) => {
+  ws.addEventListener("message", async (event: MessageEvent) => {
     try {
-      await handleWebSocketMessage(ws, data);
+      await handleWebSocketMessage(ws, event.data);
     } catch (error) {
       console.error("Error handling WebSocket message:", error);
       ws.send(JSON.stringify({
@@ -123,18 +226,18 @@ router.get("/ws", async (ctx) => {
     }
   });
   
-  ws.on("close", () => {
+  ws.addEventListener("close", () => {
     handleWebSocketClose(ws);
   });
   
-  ws.on("error", (error) => {
+  ws.addEventListener("error", (error: Event) => {
     console.error("WebSocket error:", error);
     handleWebSocketClose(ws);
   });
 });
 
 // Handle WebSocket messages
-async function handleWebSocketMessage(ws: WebSocket, data: string) {
+async function handleWebSocketMessage(ws: WebSocket & { playerId?: string; isAdmin?: boolean; deviceInfo?: any; lastPing?: number; lastPong?: number }, data: string) {
   const message = JSON.parse(data);
   console.log("Received message:", message.type);
   
@@ -204,7 +307,7 @@ async function handleWebSocketMessage(ws: WebSocket, data: string) {
 }
 
 // Handle hello message
-async function handleHello(ws: WebSocket, message: any) {
+async function handleHello(ws: WebSocket & { playerId?: string; isAdmin?: boolean; deviceInfo?: any }, message: any) {
   const { playerId, isAdmin, deviceInfo } = message;
   
   if (isAdmin) {
@@ -229,7 +332,7 @@ async function handleHello(ws: WebSocket, message: any) {
 }
 
 // Handle player registration
-async function handleRegister(ws: WebSocket, message: any) {
+async function handleRegister(ws: WebSocket & { playerId?: string }, message: any) {
   const { playerId, name, phone, stake, gameType, payment } = message;
   
   // Validate input
@@ -277,7 +380,7 @@ async function handleRegister(ws: WebSocket, message: any) {
 }
 
 // Handle room join
-async function handleJoinRoom(ws: WebSocket, message: any) {
+async function handleJoinRoom(ws: WebSocket & { playerId?: string }, message: any) {
   const { playerId, roomId } = message;
   
   const player = players.get(playerId);
@@ -343,7 +446,7 @@ async function handleJoinRoom(ws: WebSocket, message: any) {
 }
 
 // Handle room leave
-async function handleLeaveRoom(ws: WebSocket, message: any) {
+async function handleLeaveRoom(ws: WebSocket & { playerId?: string }, message: any) {
   const { playerId, roomId } = message;
   
   const player = players.get(playerId);
@@ -375,7 +478,7 @@ async function handleLeaveRoom(ws: WebSocket, message: any) {
 }
 
 // Handle game start
-async function handleStartGame(ws: WebSocket, message: any) {
+async function handleStartGame(ws: WebSocket & { isAdmin?: boolean }, message: any) {
   const { roomId, gameType, stake } = message;
   
   const room = rooms.get(roomId);
@@ -420,7 +523,7 @@ async function handleStartGame(ws: WebSocket, message: any) {
 }
 
 // Handle number called
-async function handleNumberCalled(ws: WebSocket, message: any) {
+async function handleNumberCalled(ws: WebSocket & { isAdmin?: boolean }, message: any) {
   const { roomId, number } = message;
   
   const room = rooms.get(roomId);
@@ -474,7 +577,7 @@ async function handleMark(ws: WebSocket, message: any) {
 }
 
 // Handle win announcement
-async function handleWin(ws: WebSocket, message: any) {
+async function handleWin(ws: WebSocket & { playerId?: string }, message: any) {
   const { playerId, pattern, amount } = message;
   
   const player = players.get(playerId);
@@ -549,7 +652,7 @@ async function handleWin(ws: WebSocket, message: any) {
 }
 
 // Handle chat messages
-async function handleChat(ws: WebSocket, message: any) {
+async function handleChat(ws: WebSocket & { playerId?: string }, message: any) {
   const { playerId, roomId, text } = message;
   
   const player = players.get(playerId);
@@ -569,7 +672,7 @@ async function handleChat(ws: WebSocket, message: any) {
 }
 
 // Handle payment
-async function handlePayment(ws: WebSocket, message: any) {
+async function handlePayment(ws: WebSocket & { playerId?: string }, message: any) {
   const { playerId, amount } = message;
   
   const player = players.get(playerId);
@@ -597,7 +700,7 @@ async function handlePayment(ws: WebSocket, message: any) {
 }
 
 // Handle withdrawal
-async function handleWithdraw(ws: WebSocket, message: any) {
+async function handleWithdraw(ws: WebSocket & { playerId?: string }, message: any) {
   const { playerId, amount, accountNumber } = message;
   
   const player = players.get(playerId);
@@ -638,8 +741,98 @@ async function handleWithdraw(ws: WebSocket, message: any) {
   }));
 }
 
+// Admin command handlers
+function handleAdminBroadcast(ws: WebSocket, data: any) {
+  const { message, roomId } = data;
+  if (roomId) {
+    broadcastToRoom(roomId, {
+      type: "admin_message",
+      message,
+      timestamp: new Date().toISOString()
+    });
+  } else {
+    // Broadcast to all rooms
+    rooms.forEach((room, id) => {
+      broadcastToRoom(id, {
+        type: "admin_message",
+        message,
+        timestamp: new Date().toISOString()
+      });
+    });
+  }
+}
+
+function handleKickPlayer(ws: WebSocket, data: any) {
+  const { playerId } = data;
+  const player = players.get(playerId);
+  if (player) {
+    if (player.roomId) {
+      const room = rooms.get(player.roomId);
+      if (room) {
+        room.players.delete(playerId);
+        broadcastToRoom(room.id, {
+          type: "player_kicked",
+          playerId
+        });
+      }
+    }
+    players.delete(playerId);
+    if (player.socket) {
+      player.socket.close(1000, "Kicked by admin");
+    }
+  }
+}
+
+function handleGetStats(ws: WebSocket) {
+  const stats = {
+    totalRooms: rooms.size,
+    totalPlayers: players.size,
+    activeGames: Array.from(rooms.values()).filter(room => room.active).length,
+    totalRevenue: Array.from(players.values())
+      .reduce((sum, player) => sum + (player.payment || 0), 0),
+    totalWinnings: Array.from(players.values())
+      .reduce((sum, player) => sum + (player.wonAmount || 0), 0)
+  };
+  
+  ws.send(JSON.stringify({
+    type: "stats",
+    stats
+  }));
+}
+
+function handleGetPlayers(ws: WebSocket, data: any) {
+  const { roomId } = data;
+  let playerList;
+  
+  if (roomId) {
+    const room = rooms.get(roomId);
+    playerList = room ? Array.from(room.players).map(id => {
+      const player = players.get(id)!;
+      return {
+        id: player.id,
+        name: player.name,
+        balance: player.balance,
+        markedNumbers: Array.from(player.markedNumbers)
+      };
+    }) : [];
+  } else {
+    playerList = Array.from(players.values()).map(player => ({
+      id: player.id,
+      name: player.name,
+      roomId: player.roomId,
+      balance: player.balance,
+      payment: player.payment
+    }));
+  }
+  
+  ws.send(JSON.stringify({
+    type: "players_list",
+    players: playerList
+  }));
+}
+
 // Handle admin commands
-async function handleAdminCommand(ws: WebSocket, message: any) {
+async function handleAdminCommand(ws: WebSocket & { isAdmin?: boolean }, message: any) {
   if (!ws.isAdmin) {
     ws.send(JSON.stringify({
       type: "error",
@@ -676,7 +869,7 @@ async function handleAdminCommand(ws: WebSocket, message: any) {
 }
 
 // Handle ping
-function handlePing(ws: WebSocket, message: any) {
+function handlePing(ws: WebSocket & { lastPing?: number }, message: any) {
   ws.lastPing = Date.now();
   ws.send(JSON.stringify({
     type: "pong",
@@ -685,12 +878,12 @@ function handlePing(ws: WebSocket, message: any) {
 }
 
 // Handle pong
-function handlePong(ws: WebSocket, message: any) {
+function handlePong(ws: WebSocket & { lastPong?: number }, message: any) {
   ws.lastPong = Date.now();
 }
 
 // Handle WebSocket close
-function handleWebSocketClose(ws: WebSocket) {
+function handleWebSocketClose(ws: WebSocket & { playerId?: string; isAdmin?: boolean }) {
   const playerId = ws.playerId;
   
   if (ws.isAdmin) {
@@ -752,16 +945,6 @@ function getRequiredNumbersForPattern(pattern: string, gameType: string): number
   // Simplified - return dummy numbers
   // In production, implement proper pattern checking
   return [1, 2, 3, 4, 5];
-}
-
-// Helper function: Broadcast to admins
-function broadcastToAdmins(message: any) {
-  const messageStr = JSON.stringify(message);
-  adminConnections.forEach(admin => {
-    if (admin.readyState === 1) { // OPEN
-      admin.send(messageStr);
-    }
-  });
 }
 
 // Start server
